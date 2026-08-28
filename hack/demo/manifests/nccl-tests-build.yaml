@@ -1,0 +1,73 @@
+# ONE-TIME SETUP -- run well before recording, not on camera.
+#
+# There is no current prebuilt nccl-tests image available anonymously:
+#
+# So we build it once into a PVC. The demo Job then mounts that PVC and simply
+# executes the binary -- no clone, no apt, no compile on the critical path of a
+# live take. Pre-building a tool is the same class of thing as pre-pulling an
+# image: it does not touch what gets measured.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-bench
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nccl-tests
+  namespace: gpu-bench
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+  # storageClassName omitted on purpose -- uses the cluster default
+  # (local-path on this single-node child).
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nccl-tests-build
+  namespace: gpu-bench
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: build
+          # -devel gives nvcc and a toolchain. NCCL headers are installed
+          # explicitly rather than assumed -- the devel images vary on whether
+          # libnccl-dev is present, and guessing wrong fails the build.
+          image: nvcr.io/nvidia/cuda:12.6.3-devel-ubuntu22.04
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euxo pipefail
+              if [ -x /work/build/all_reduce_perf ]; then
+                echo "already built; nothing to do"; exit 0
+              fi
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends git ca-certificates make g++
+              # Install NCCL dev headers only if the base image lacks them.
+              if [ ! -f /usr/include/nccl.h ]; then
+                apt-get install -y --no-install-recommends libnccl2 libnccl-dev
+              fi
+              rm -rf /tmp/src && git clone --depth 1 \
+                https://github.com/NVIDIA/nccl-tests /tmp/src
+              cd /tmp/src
+              # MPI=0: single process driving both GPUs. This node has one
+              # host, so there is no multi-node rendezvous to arrange.
+              make MPI=0 -j"$(nproc)"
+              mkdir -p /work/build
+              cp -a build/. /work/build/
+              /work/build/all_reduce_perf --help >/dev/null 2>&1 || true
+              ls -la /work/build/ | sed 's/^/BUILT: /'
+          volumeMounts:
+            - { name: work, mountPath: /work }
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: nccl-tests

@@ -1,0 +1,51 @@
+# Deliver the NVIDIA AI stack to every cluster labelled group=gpu-fleet.
+#
+# The recipe is named, not assembled: `service: k0s` is a value our data pack
+# registers, so these four criteria resolve the pack's k0s-h200-training leaf
+# rather than an upstream one. Upstream has no service value for bare-metal
+# Kubernetes, and `intent: training` is rejected without a concrete service.
+#
+# environment.k0sContainerd / environment.preinstalledDriver stay FALSE on
+# purpose: the pack already carries those facts (gpu-operator driver off,
+# toolkit on and pointed at k0s's own containerd, nvidiaDriverRoot /). Setting
+# both here as well would apply the same overrides twice, from two places.
+apiVersion: k0rdent.mirantis.com/v1beta1
+kind: MultiClusterService
+metadata:
+  name: aicr-h200
+spec:
+  clusterSelector:
+    matchLabels:
+      group: gpu-fleet
+  serviceSpec:
+    services:
+      - template: nvidia-aicr-0-1-0
+        name: nvidia-aicr
+        namespace: aicr
+        values: |
+          nvidia-aicr:
+            service: k0s
+            accelerator: h200
+            intent: training
+
+            dataPack: ghcr.io/ramessesii2/aicr-packs/k0s-h200-training:0.1.0
+
+            # --best-effort keeps the install going past a component that needs
+            # hardware this node lacks; --no-wait returns once manifests are
+            # applied rather than blocking on every rollout.
+            deploy:
+              enabled: false
+            deployFlags: "--best-effort --no-wait"
+
+            validate:
+              enabled: true
+              phases: [deployment]
+              failOnError: false
+              emitEvidence: true
+              publish:
+                enabled: true
+                mode: unsigned
+                ref: ghcr.io/ramessesii2/aicr-evidence
+                # dockerconfigjson Secret in THIS namespace on the CHILD
+                registrySecret: ghcr-evidence-push
+                failOnError: true

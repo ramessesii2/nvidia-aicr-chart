@@ -1,0 +1,72 @@
+# THE ON-CAMERA JOB. Requires nccl-tests-build.yaml to have completed once.
+#
+#   kubectl apply -f hack/demo/manifests/nccl-allreduce-job.yaml
+#   kubectl logs -n gpu-bench -f job/nccl-allreduce
+#
+# Proves what `nvidia-smi` alone does not: that a user workload can actually
+# ALLOCATE both H200s, and that they exchange data over the fabric. The number
+# to read aloud is the last line -- "Avg bus bandwidth" in GB/s.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nccl-allreduce
+  namespace: gpu-bench
+spec:
+  backoffLimit: 0            # a retry mid-take restarts the segment
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: allreduce
+          # Runtime only -- the binary comes from the PVC, so this pulls far
+          # less than the -devel image used to build it.
+          image: nvcr.io/nvidia/cuda:12.6.3-runtime-ubuntu22.04
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              # Guard: this Job and the build Job can both mount the PVC at
+              # once, so applying this too early yields a bare "No such file or
+              # directory" from bash rather than anything actionable. Observed
+              # 2026-08-30: applied 11s after the build started, which takes
+              # ~3m. Fail loudly and say what to do instead.
+              if [ ! -x /work/build/all_reduce_perf ]; then
+                echo "ERROR: /work/build/all_reduce_perf is missing."
+                echo "The build Job has not finished. Wait for it:"
+                echo "  kubectl wait --for=condition=complete -n gpu-bench job/nccl-tests-build --timeout=15m"
+                ls -la /work /work/build 2>&1 || true
+                exit 1
+              fi
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              echo
+              echo "NVLink topology:"
+              nvidia-smi topo -m || true
+              echo
+              # -b 8   start at 8 bytes
+              # -e 2G  end at 2 GiB
+              # -f 2   double the size each step
+              # -g 2   one process driving both GPUs on this node
+              exec /work/build/all_reduce_perf -b 8 -e 2G -f 2 -g 2
+          env:
+            - name: NCCL_DEBUG
+              value: WARN
+          resources:
+            limits:
+              # Device-plugin path. If the pack's overlay disabled the device
+              # plugin in favour of DRA, this never satisfies and the pod stays
+              # Pending -- settle this in rehearsal before recording.
+              nvidia.com/gpu: 2
+          volumeMounts:
+            - { name: work, mountPath: /work, readOnly: true }
+            - { name: shm,  mountPath: /dev/shm }
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: nccl-tests
+        - name: shm
+          # NCCL uses shared memory for intra-node transport; the 64 MB default
+          # produces an opaque failure rather than a clear one.
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
